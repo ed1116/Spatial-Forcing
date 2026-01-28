@@ -487,7 +487,7 @@ class TrainConfig:
     align_loss_coeff: float = 0.0
 
     # Precision for PyTorch training.
-    pytorch_training_precision: Literal["bfloat16", "float32"] = "bfloat16"
+    pytorch_training_precision: Literal["bfloat16", "float16", "float32"] = "float32"
 
     lr_schedule: _optimizer.LRScheduleConfig = dataclasses.field(default_factory=_optimizer.CosineDecaySchedule)
     optimizer: _optimizer.OptimizerConfig = dataclasses.field(default_factory=_optimizer.AdamW)
@@ -495,6 +495,13 @@ class TrainConfig:
 
     # Specifies which weights should be frozen.
     freeze_filter: tyro.conf.Suppress[Filter] = dataclasses.field(default_factory=nnx.Nothing)
+
+    # [COPILOT] LoRA (PyTorch only)
+    lora_enabled: bool = False
+    lora_rank: int = 8
+    lora_alpha: float = 16.0
+    lora_dropout: float = 0.05
+    lora_target_modules: Sequence[str] | None = None
 
     # Determines the data to be trained on.
     data: DataConfigFactory = dataclasses.field(default_factory=FakeDataConfig)
@@ -807,9 +814,81 @@ _CONFIGS = [
         ema_decay=None,
         wandb_enabled=False,
     ),
+    
+    # [COPILOT]
+    #############################################################################
+    TrainConfig(
+        name="pi0_align_libero_lora",
+        model=pi0_config.Pi0Config(),
+        data=LeRobotLiberoDataConfig(
+            repo_id="physical-intelligence/libero",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=True,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        pytorch_weight_path="./checkpoints/pi0_base_full_torch",
+        vggt_weight_path="./checkpoints/vggt",
+        vla_layers_align=12,
+        vggt_layers_align=-1,
+        pytorch_training_precision="float32", # [DEBUG]
+        pooling_func="bilinear",
+        use_vggt_pe=True,
+        use_vlm_norm=True,
+        align_loss_coeff=0.5,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=100,
+            peak_lr=2.5e-5,
+            decay_steps=3000,
+            decay_lr=2.5e-6,
+        ),
+        lora_enabled=True,
+        lora_rank=8,
+        lora_alpha=16.0,
+        lora_dropout=0.05,
+        lora_target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+        num_train_steps=3000,
+        save_interval=1000,
+        batch_size=32,
+        ema_decay=None,
+        wandb_enabled=True,
+    ),
+    #############################################################################
+    
+    # [COPILOT]
+    #############################################################################
+    TrainConfig(
+        name="pi0_libero_lora",
+        model=pi0_config.Pi0Config(),
+        data=LeRobotLiberoDataConfig(
+            repo_id="physical-intelligence/libero",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=True,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        pytorch_weight_path="./checkpoints/pi0_base_full_torch",
+        pytorch_training_precision="float32", # [DEBUG]
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=100,
+            peak_lr=2.5e-5,
+            decay_steps=3000,
+            decay_lr=2.5e-6,
+        ),
+        lora_enabled=True,
+        lora_rank=8,
+        lora_alpha=16.0,
+        lora_dropout=0.05,
+        lora_target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+        num_train_steps=3000,
+        save_interval=1000,
+        batch_size=32,
+        ema_decay=None,
+        wandb_enabled=True,
+    ),
+    #############################################################################
+
     #
     # This is a test config that is used to illustate how train on a custom LeRobot dataset.
-    # For instuctions on how to convert and train on your own Aloha dataset see examples/aloha_real/README.md
+    # For instructions on how to convert and train on your own Aloha dataset see examples/aloha_real/README.md
     TrainConfig(
         name="pi0_aloha_pen_uncap",
         model=pi0_config.Pi0Config(),
