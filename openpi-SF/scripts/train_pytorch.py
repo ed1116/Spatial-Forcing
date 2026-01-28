@@ -35,6 +35,7 @@ import jax
 import numpy as np
 import safetensors.torch
 import torch
+import torch.amp # [COPILOT]
 import torch.distributed as dist
 import torch.nn.parallel
 import tqdm
@@ -42,6 +43,7 @@ import wandb
 
 import openpi.models.pi0_config
 import openpi.models_pytorch.pi0_pytorch
+from openpi.models_pytorch.lora_copilot import apply_lora, get_trainable_parameters, mark_only_lora_as_trainable # [COPILOT]
 import openpi.shared.normalize as _normalize
 import openpi.training.config as _config
 import openpi.training.data_loader as _data
@@ -153,6 +155,7 @@ def save_checkpoint(model, optimizer, global_step, config, is_main, data_config)
 
     # Only save if it's time to save or if it's the final step
     if (global_step % config.save_interval == 0 and global_step > 0) or global_step == config.num_train_steps - 1:
+        
         # Create temporary directory for atomic checkpoint saving
         final_ckpt_dir = config.checkpoint_dir / f"{global_step}"
         tmp_ckpt_dir = config.checkpoint_dir / f"tmp_{global_step}"
@@ -408,6 +411,30 @@ def train_loop(config: _config.TrainConfig):
 
     model = openpi.models_pytorch.pi0_pytorch.PI0Pytorch(model_cfg).to(device)
 
+    # [COPILOT] Apply LoRA if enabled (before DDP wrapping and optimizer creation)
+    if config.lora_enabled:
+        replaced = apply_lora(
+            model,
+            rank=config.lora_rank,
+            alpha=config.lora_alpha,
+            dropout=config.lora_dropout,
+            target_modules=config.lora_target_modules,
+        )
+        # Ensure any newly-added LoRA params are moved to the training device
+        model = model.to(device)
+        mark_only_lora_as_trainable(model)
+
+        # [COPILOT] Ensure vision tower does NOT participate in LoRA updates
+        vision_tower_prefix = "paligemma_with_expert.paligemma.vision_tower"
+        for name, param in model.named_parameters():
+            if name.startswith(vision_tower_prefix) and ("lora_A" in name or "lora_B" in name):
+                param.requires_grad = False
+
+        if is_main:
+            trainable = sum(p.numel() for p in get_trainable_parameters(model))
+            total = sum(p.numel() for p in model.parameters())
+            logging.info(f"Enabled LoRA: replaced {replaced} Linear layers, trainable params={trainable}/{total}")
+
     if hasattr(model, "gradient_checkpointing_enable"):
         enable_gradient_checkpointing = True
         model.gradient_checkpointing_enable()
@@ -441,10 +468,11 @@ def train_loop(config: _config.TrainConfig):
     # Load weights from weight_loader if specified (for fine-tuning)
     if config.pytorch_weight_path is not None:
         logging.info(f"Loading weights from: {config.pytorch_weight_path}")
-
         model_path = os.path.join(config.pytorch_weight_path, "model.safetensors")
         safetensors.torch.load_model(
-            (model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model), model_path
+            (model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model),
+            model_path,
+            strict=False,
         )
         logging.info(f"Loaded PyTorch weights from {config.pytorch_weight_path}")
 
@@ -454,9 +482,12 @@ def train_loop(config: _config.TrainConfig):
     decay_steps = config.lr_schedule.decay_steps
     end_lr = config.lr_schedule.decay_lr
 
-    # Create optimizer with config parameters
+    # [COPILOT] Create optimizer with config parameters
+    optim_params = list(model.parameters())
+    if config.lora_enabled:
+        optim_params = get_trainable_parameters(model)
     optim = torch.optim.AdamW(
-        model.parameters(),
+        optim_params, # [COPILOT]
         lr=peak_lr,
         betas=(config.optimizer.b1, config.optimizer.b2),
         eps=config.optimizer.eps,
@@ -543,7 +574,12 @@ def train_loop(config: _config.TrainConfig):
                 log_memory_usage(device, global_step, "after_backward")
 
             # Gradient clipping
-            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config.optimizer.clip_gradient_norm)
+            params_to_clip = model.parameters()
+            if config.lora_enabled:
+                params_to_clip = get_trainable_parameters(model)
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                params_to_clip, max_norm=config.optimizer.clip_gradient_norm
+            )
 
             # Optimizer step
             optim.step()

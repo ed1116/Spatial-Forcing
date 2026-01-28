@@ -35,6 +35,7 @@ import jax
 import numpy as np
 import safetensors.torch
 import torch
+import torch.amp # [COPILOT]
 import torch.distributed as dist
 import torch.nn.parallel
 import tqdm
@@ -42,6 +43,7 @@ import wandb
 
 import openpi.models.pi0_config
 from openpi.models_pytorch import pi0_pytorch, pi0_align_pytorch, projectors
+from openpi.models_pytorch.lora_copilot import apply_lora, get_trainable_parameters, mark_only_lora_as_trainable # [COPILOT]
 import openpi.shared.normalize as _normalize
 import openpi.training.config as _config
 import openpi.training.data_loader as _data
@@ -155,6 +157,7 @@ def save_checkpoint(model, optimizer, global_step, config, is_main, data_config)
 
     # Only save if it's time to save or if it's the final step
     if (global_step % config.save_interval == 0 and global_step > 0) or global_step == config.num_train_steps - 1:
+        
         # Create temporary directory for atomic checkpoint saving
         final_ckpt_dir = config.checkpoint_dir / f"{global_step}"
         tmp_ckpt_dir = config.checkpoint_dir / f"tmp_{global_step}"
@@ -313,6 +316,18 @@ def train_loop(config: _config.TrainConfig):
     is_main = (not use_ddp) or (dist.get_rank() == 0)
     set_seed(config.seed, local_rank)
 
+    # [COPILOT] Setup AMP
+    use_amp = device.type == "cuda" and config.pytorch_training_precision in {"float16", "bfloat16"}
+    amp_dtype = torch.float16 if config.pytorch_training_precision == "float16" else torch.bfloat16
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp and amp_dtype == torch.float16)
+
+    def _to_device_with_dtype(x: torch.Tensor):
+        if torch.is_tensor(x):
+            if x.is_floating_point():
+                x = x.to(dtype=torch.float32)
+            return x.to(device)
+        return x
+
     # Initialize checkpoint directory and wandb
     resuming = False
     if config.resume:
@@ -415,7 +430,12 @@ def train_loop(config: _config.TrainConfig):
         enable_depth=False,
         enable_track=False,
         feature_only=True,
-    ).to(device)
+    ).to(device=device) # [COPILOT][DEBUG] VGGT is always in float32. To modify: dtype=torch.float16
+    
+    # [COPILOT] VGGT is used as a frozen feature extractor.
+    vggt_model.eval()
+    vggt_model.requires_grad_(False)
+
     align_projector = projectors.AlignProjector(
         model.LLM_width,
         config.vggt_dim,
@@ -441,6 +461,42 @@ def train_loop(config: _config.TrainConfig):
         # Set memory allocation configuration
         os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128,expandable_segments:True"
         logging.info("Enabled memory optimizations for 8+ GPU training")
+
+    # [COPILOT] Apply LoRA if enabled (before DDP wrapping and optimizer creation)
+    if config.lora_enabled:
+        replaced = apply_lora(
+            model,
+            rank=config.lora_rank,
+            alpha=config.lora_alpha,
+            dropout=config.lora_dropout,
+            target_modules=config.lora_target_modules,
+        )
+        mark_only_lora_as_trainable(model)
+
+        # [COPILOT] Ensure vision tower does NOT participate in LoRA updates
+        vision_tower_prefix = "paligemma_with_expert.paligemma.vision_tower"
+        for name, param in model.named_parameters():
+            if name.startswith(vision_tower_prefix) and ("lora_A" in name or "lora_B" in name):
+                param.requires_grad = False
+
+        if is_main:
+            trainable = sum(p.numel() for p in get_trainable_parameters(model))
+            total = sum(p.numel() for p in model.parameters())
+            logging.info(f"Enabled LoRA: replaced {replaced} Linear layers, trainable params={trainable}/{total}")
+
+    # [COPILOT] Keep FP32 weights when GradScaler is enabled; otherwise honor training precision
+    if use_amp and amp_dtype == torch.float16:
+        model = model.to(device=device, dtype=torch.float32)
+        align_projector = align_projector.to(device=device, dtype=torch.float32)
+    else:
+        if config.pytorch_training_precision == "bfloat16":
+            target_dtype = torch.bfloat16
+        elif config.pytorch_training_precision == "float16":
+            target_dtype = torch.float16
+        else:
+            target_dtype = torch.float32
+        model = model.to(device=device, dtype=target_dtype)
+        align_projector = align_projector.to(device=device, dtype=target_dtype)
 
     if use_ddp:
         model = torch.nn.parallel.DistributedDataParallel(
@@ -481,9 +537,13 @@ def train_loop(config: _config.TrainConfig):
     decay_steps = config.lr_schedule.decay_steps
     end_lr = config.lr_schedule.decay_lr
 
-    # Create optimizer with config parameters
+    # [COPILOT] Create optimizer with config parameters
+    optim_params = list(model.parameters()) + list(align_projector.parameters())
+    if config.lora_enabled:
+        optim_params = get_trainable_parameters(model) + list(align_projector.parameters())
+
     optim = torch.optim.AdamW(
-        list(model.parameters()) + list(align_projector.parameters()),
+        optim_params, # [COPILOT]
         lr=peak_lr,
         betas=(config.optimizer.b1, config.optimizer.b2),
         eps=config.optimizer.eps,
@@ -546,7 +606,7 @@ def train_loop(config: _config.TrainConfig):
                 break
 
             # The unified data loader returns (observation, actions) tuple
-            observation = jax.tree.map(lambda x: x.to(device), observation)  # noqa: PLW2901
+            observation = jax.tree.map(_to_device_with_dtype, observation)  # noqa: PLW2901, [COPILOT]
             actions = actions.to(torch.float32)  # noqa: PLW2901
             actions = actions.to(device)  # noqa: PLW2901
 
@@ -554,22 +614,35 @@ def train_loop(config: _config.TrainConfig):
             for pg in optim.param_groups:
                 pg["lr"] = lr_schedule(global_step)
 
-            # Forward pass
-            action_losses, align_loss = model(observation, actions, vggt=vggt_model, align_proj=align_projector)
-            loss = action_losses + config.align_loss_coeff * align_loss
+            # Forward pass (AMP) [COPILOT]
+            with torch.amp.autocast(device_type=device.type, enabled=use_amp, dtype=amp_dtype):
+                action_losses, align_loss = model(observation, actions, vggt=vggt_model, align_proj=align_projector)
+                loss = action_losses + config.align_loss_coeff * align_loss
 
-            # Backward pass
-            loss.backward()
+            # Backward pass [COPILOT]
+            if scaler.is_enabled():
+                scaler.scale(loss).backward()
+            else:
+                loss.backward()
 
             # Log memory usage after backward pass
             if global_step < 5 and is_main and torch.cuda.is_available():
                 log_memory_usage(device, global_step, "after_backward")
 
-            # Gradient clipping
-            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config.optimizer.clip_gradient_norm)
+            # [COPILOT] Gradient clipping
+            params_to_clip = model.parameters()
+            if config.lora_enabled:
+                params_to_clip = get_trainable_parameters(model)
+            if scaler.is_enabled():
+                scaler.unscale_(optim)
+            grad_norm = torch.nn.utils.clip_grad_norm_(params_to_clip, max_norm=config.optimizer.clip_gradient_norm)
 
             # Optimizer step
-            optim.step()
+            if scaler.is_enabled():
+                scaler.step(optim)
+                scaler.update()
+            else:
+                optim.step()
             optim.zero_grad(set_to_none=True)
 
             # Clear gradients more aggressively

@@ -246,19 +246,6 @@ class BaseModelConfig(abc.ABC):
     def load_pytorch(self, train_config, weight_path: str):
         logger.info(f"train_config: {train_config}")
         model = pi0_pytorch.PI0Pytorch(config=train_config.model)
-        
-        # [COPILOT] Apply LoRA modules before loading weights if enabled
-        if getattr(train_config, "lora_enabled", False):
-            from openpi.models_pytorch.lora_copilot import apply_lora
-
-            apply_lora(
-                model,
-                rank=train_config.lora_rank,
-                alpha=train_config.lora_alpha,
-                dropout=train_config.lora_dropout,
-                target_modules=train_config.lora_target_modules,
-            )
-        
         safetensors.torch.load_model(model, weight_path)
         return model
 

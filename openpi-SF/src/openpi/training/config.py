@@ -848,7 +848,7 @@ _CONFIGS = [
         lora_target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
         num_train_steps=3000,
         save_interval=1000,
-        batch_size=32,
+        batch_size=16,
         ema_decay=None,
         wandb_enabled=True,
     ),
