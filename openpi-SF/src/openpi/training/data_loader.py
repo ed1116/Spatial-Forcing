@@ -262,6 +262,8 @@ def create_data_loader(
         shuffle=shuffle,
         num_batches=num_batches,
         num_workers=config.num_workers,
+        pin_memory=config.pin_memory, # [COPILOT] Added pin_memory
+        prefetch_factor=config.prefetch_factor, # [COPILOT] Added prefetch_factor
         seed=config.seed,
         skip_norm_stats=skip_norm_stats,
         framework=framework,
@@ -279,6 +281,8 @@ def create_torch_data_loader(
     shuffle: bool = False,
     num_batches: int | None = None,
     num_workers: int = 0,
+    pin_memory: bool = True, # [COPILOT] Added pin_memory
+    prefetch_factor: int = 2, # [COPILOT] Added prefetch_factor
     seed: int = 0,
     framework: str = "jax",
 ) -> DataLoader[tuple[_model.Observation, _model.Actions]]:
@@ -330,6 +334,8 @@ def create_torch_data_loader(
         sampler=sampler,
         num_batches=num_batches,
         num_workers=num_workers,
+        pin_memory=pin_memory, # [COPILOT] Added pin_memory
+        prefetch_factor=prefetch_factor, # [COPILOT] Added prefetch_factor
         seed=seed,
         framework=framework,
     )
@@ -391,6 +397,8 @@ class TorchDataLoader:
         sampler: torch.utils.data.Sampler | None = None,
         num_batches: int | None = None,
         num_workers: int = 0,
+        pin_memory: bool = True, # [COPILOT] Added pin_memory
+        prefetch_factor: int = 2, # [COPILOT] Added prefetch_factor
         seed: int = 0,
         framework: str = "jax",
     ):
@@ -431,18 +439,24 @@ class TorchDataLoader:
 
         generator = torch.Generator()
         generator.manual_seed(seed)
-        self._data_loader = torch.utils.data.DataLoader(
-            typing.cast(torch.utils.data.Dataset, dataset),
+        dl_kwargs = dict(
             batch_size=local_batch_size,
             shuffle=(sampler is None and shuffle),  # Don't shuffle if using sampler
             sampler=sampler,
             num_workers=num_workers,
             multiprocessing_context=mp_context,
+            pin_memory=pin_memory,
             persistent_workers=num_workers > 0,
             collate_fn=_collate_fn,
             worker_init_fn=_worker_init_fn,
             drop_last=True,
             generator=generator,
+        )
+        if num_workers > 0:
+            dl_kwargs["prefetch_factor"] = prefetch_factor
+        self._data_loader = torch.utils.data.DataLoader(
+            typing.cast(torch.utils.data.Dataset, dataset),
+            **dl_kwargs,
         )
 
     @property

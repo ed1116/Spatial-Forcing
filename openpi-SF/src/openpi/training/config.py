@@ -518,6 +518,11 @@ class TrainConfig:
     # Number of workers to use for the data loader. Increasing this number will speed up data loading but
     # will increase memory and CPU usage.
     num_workers: int = 2
+    
+    # [COPILOT] DataLoader options (PyTorch datasets only).
+    pin_memory: bool = True
+    prefetch_factor: int = 4
+    
     # Number of train steps (batches) to run.
     num_train_steps: int = 30_000
 
@@ -849,6 +854,8 @@ _CONFIGS = [
         num_train_steps=3000,
         save_interval=1000,
         batch_size=16,
+
+        num_workers=8, # [COPILOT] Increased num_workers for data loading
         ema_decay=None,
         wandb_enabled=True,
     ),
@@ -881,6 +888,8 @@ _CONFIGS = [
         num_train_steps=3000,
         save_interval=1000,
         batch_size=32,
+
+        num_workers=8, # [COPILOT] Increased num_workers for data loading
         ema_decay=None,
         wandb_enabled=True,
     ),
