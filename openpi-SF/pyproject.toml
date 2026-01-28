@@ -41,8 +41,7 @@ dependencies = [
     "gradio==5.17.1",
     "viser==0.2.23",
     "hydra-core",
-    "onnxruntime",
-    "nvidia-ml-py>=13.590.48",
+    "onnxruntime"
 ]
 
 
@@ -57,10 +56,8 @@ dev = [
     "ipykernel>=6.29.5",
     "ipywidgets>=8.1.5",
     "matplotlib>=3.10.0",
+    "pynvml>=12.0.0",
 ]
-
-# [COPILOT] Omitted "pynvml>=12.0.0" because of deprecation issue.
-
 rlds = [
     "dlimp",
     "tensorflow-cpu==2.15.0",
